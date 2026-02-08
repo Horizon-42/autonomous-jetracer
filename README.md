@@ -187,12 +187,14 @@ Output: `output_models/mb1-ssd-Epoch-*-Loss-*.pth` + `labels.txt`
 
 The inference node supports two interchangeable detection backends. Both the MobileNet-V1 SSD and YOLOv11 engines are available in the repo — swap between them by changing `DETECTION_ENGINE_PATH` in `main.py`:
 
+
 ```python
 # Option A: YOLOv11 (default)
 DETECTION_ENGINE_PATH = "./models/yolo11.engine"
 
 # Option B: MobileNet-V1 SSD
 DETECTION_ENGINE_PATH = "./models/mobilenet_ssd.engine"
+# *all models can be found in "onnx" folder
 ```
 
 Both models are trained on the same class set defined in `labels.txt`. The YOLO engine uses the `YoloTRT` class with built-in pre/postprocessing, while the MobileNet SSD uses the generic `TRTInference` class. The rest of the pipeline (state machine, throttle control, telemetry) remains identical regardless of which backend is active.
