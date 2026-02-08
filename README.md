@@ -137,7 +137,7 @@ The inference node publishes ZMQ multipart messages on a PUB socket (port 5555) 
 
 ## Training
 
-### Driving Model — ResNet-18 (`train_resnet.py`)
+### Driving Model — ResNet-18 (`train_resnet18.py`)
 
 Supervised regression on manually collected steering and throttle labels. The dataset is a zip archive containing a `catalog.csv` and an `images/` directory, collected via the DonkeyCar data pipeline.
 
@@ -154,7 +154,7 @@ Supervised regression on manually collected steering and throttle labels. The da
 | `LEARNING_RATE` | 1e-4    |
 
 ```bash
-python train_resnet.py
+python train_resnet18.py
 ```
 
 Output: `output_models/resnet18_merged_csv_v1.pth`
@@ -179,9 +179,30 @@ python train_mobilenet_ssd.py
 
 Output: `output_models/mb1-ssd-Epoch-*-Loss-*.pth` + `labels.txt`
 
-### Detection Model — YOLOv11
+### Detection Model — YOLOv11 (`train_yolo11.py`)
 
-> **TODO** — Training script to be added. The current YOLOv11 engine (`yolo11.engine`) was trained separately and exported to TensorRT.
+Finetunes a YOLOv11 model using the Ultralytics training pipeline. Includes automatic class-balanced resampling — underrepresented classes are oversampled (weighted by per-image instance count) until all classes reach parity with the most frequent class.
+
+**Pipeline:** parse `data.yaml` → load train image list → scan label files for per-class instance counts → build balanced train list via weighted resampling → write `data_balanced.yaml` → train with Ultralytics.
+
+**Augmentation:** HSV jitter, rotation (±2°), translation, scale, shear, perspective, horizontal flip, mosaic, mixup, copy-paste, and erasing.
+
+| Parameter         | Default                              |
+|-------------------|--------------------------------------|
+| `--model`         | `yolo11n.pt`                         |
+| `--epochs`        | 50                                   |
+| `--imgsz`         | 320                                  |
+| `--batch`         | 32                                   |
+| `--balance-seed`  | 42                                   |
+| `--no-balance`    | disabled (balancing on by default)   |
+
+```bash
+python train_yolo11.py --data-yaml finetune_dataset/splits/data.yaml --model yolo11n.pt
+```
+
+Output: `runs/finetune/<model>_signs/weights/best.pt`
+
+The resulting `.pt` is exported to ONNX and then converted to a TensorRT engine on the Jetson.
 
 ### Swapping Detection Backends
 
