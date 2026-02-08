@@ -1,3 +1,10 @@
+"""TensorRT YOLO detector with preprocessing, NMS, and visualization helpers.
+
+This module loads a TensorRT engine, runs inference on images, applies
+confidence filtering + NMS, and returns a list of detections:
+  {"box": [x1, y1, x2, y2], "conf": float, "class_id": int}
+"""
+
 import atexit
 import time
 from pathlib import Path
@@ -27,6 +34,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 # --- 2. HELPER FUNCTIONS ---
 
 def load_class_names(source=None):
+    """Load class labels from a list or a newline-delimited text file."""
     if source is None:
         return []
     if isinstance(source, (list, tuple)):
@@ -40,11 +48,13 @@ def _color_for_class(class_id):
     return PALETTE[class_id % len(PALETTE)]
 
 def _text_color_for_bg(bgr):
+    """Choose black/white text for contrast against a background color."""
     b, g, r = bgr
     luminance = 0.114 * b + 0.587 * g + 0.299 * r
     return (0, 0, 0) if luminance > 140 else (255, 255, 255)
 
 def _draw_text_with_bg(image, text, origin, bg_color, font_scale, thickness):
+    """Draw label text with a filled rectangle background for readability."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     x, y = origin
@@ -57,6 +67,7 @@ def _draw_text_with_bg(image, text, origin, bg_color, font_scale, thickness):
     cv2.putText(image, text, (x + 1, y - 1), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 def _letterbox(image, new_shape, color=(114, 114, 114)):
+    """Resize while preserving aspect ratio and pad to target shape."""
     shape = image.shape[:2]  # h, w
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
@@ -76,6 +87,7 @@ def _letterbox(image, new_shape, color=(114, 114, 114)):
     return out, r, (left, top)
 
 def _xywh_to_xyxy(xywh):
+    """Convert center-x/y, width/height boxes to x1/y1/x2/y2."""
     xyxy = xywh.copy()
     xyxy[:, 0] = xywh[:, 0] - xywh[:, 2] / 2
     xyxy[:, 1] = xywh[:, 1] - xywh[:, 3] / 2
@@ -84,6 +96,7 @@ def _xywh_to_xyxy(xywh):
     return xyxy
 
 def _clip_boxes(boxes, shape):
+    """Clamp boxes to image boundaries."""
     h, w = shape[:2]
     boxes[:, 0] = np.clip(boxes[:, 0], 0, w - 1)
     boxes[:, 1] = np.clip(boxes[:, 1], 0, h - 1)
@@ -92,12 +105,14 @@ def _clip_boxes(boxes, shape):
     return boxes
 
 def _scale_boxes(boxes, ratio, pad, shape):
+    """Undo letterbox scaling/padding to map boxes to original image size."""
     boxes[:, [0, 2]] -= pad[0]
     boxes[:, [1, 3]] -= pad[1]
     boxes[:, :4] /= ratio
     return _clip_boxes(boxes, shape)
 
 def _nms(boxes, scores, iou_thres):
+    """Basic CPU NMS for a single class."""
     if len(boxes) == 0: return []
     boxes = boxes.astype(np.float32)
     scores = scores.astype(np.float32)
@@ -123,28 +138,35 @@ def _nms(boxes, scores, iou_thres):
     return keep
 
 def _normalize_output(outputs):
+    """Handle different TensorRT output layouts and return a 2D array."""
     output = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
     output = np.asarray(output)
     if output.ndim == 3:
+        # Some engines output (1, anchors, dims) or (1, dims, anchors).
+        # Normalize to (anchors, dims).
         if output.shape[1] < output.shape[2]:
             output = np.transpose(output, (0, 2, 1))
         output = output[0]
     elif output.ndim == 2:
         pass
     else:
+        # Flatten unknown layouts into (N, D).
         output = output.reshape(-1, output.shape[-1])
     return output
 
 def _decode_predictions(preds, conf_thres, num_classes=None, box_format="auto"):
+    """Decode raw model output into boxes/scores/class_ids."""
     if preds.size == 0:
         return np.zeros((0, 4)), np.zeros((0,)), np.zeros((0,), dtype=int)
     dim = preds.shape[1]
     if dim in (6, 7):
+        # Already includes [x, y, w, h, conf, cls_id] or similar.
         coords = preds[:, :4]
         scores = preds[:, 4]
         class_ids = preds[:, 5].astype(int)
         if box_format == "xywh": coords = _xywh_to_xyxy(coords)
     else:
+        # Typical YOLO export: [x, y, w, h, cls0, cls1, ...].
         coords = preds[:, :4]
         scores_raw = preds[:, 4:]
         if num_classes is not None:
@@ -158,6 +180,7 @@ def _decode_predictions(preds, conf_thres, num_classes=None, box_format="auto"):
     return coords[mask], scores[mask], class_ids[mask]
 
 def draw_detections(image_bgr, detections, class_names=None):
+    """Render bounding boxes + labels on a BGR image."""
     output = image_bgr.copy()
     h, w = output.shape[:2]
     thickness = max(1, int(round(min(h, w) / 400)))
@@ -173,6 +196,7 @@ def draw_detections(image_bgr, detections, class_names=None):
     return output
 
 def collect_images(path):
+    """Return a list of images from a folder or a single image path."""
     path = Path(path)
     if path.is_dir():
         return [p for p in sorted(path.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
@@ -192,6 +216,7 @@ class TrtYoloDetector:
         if not self.engine_path.exists():
             raise FileNotFoundError(f"Engine not found: {self.engine_path}")
 
+        # TensorRT/pycuda context setup must happen before any GPU allocations.
         cuda.init()
         self._cuda_context = cuda.Device(device_id).make_context()
         atexit.register(self._cleanup)
@@ -211,6 +236,7 @@ class TrtYoloDetector:
         self._context = self._engine.create_execution_context()
         self._stream = cuda.Stream()
         
+        # Find the input binding index (TensorRT engines can have multiple bindings).
         self._input_index = 0
         for i in range(self._engine.num_bindings):
             if self._engine.binding_is_input(i):
@@ -227,6 +253,7 @@ class TrtYoloDetector:
         self.last_inference_time = None
 
     def _cleanup(self):
+        """Release the CUDA context cleanly on exit."""
         if self._cuda_context:
             try: self._cuda_context.pop()
             except: pass
@@ -235,12 +262,14 @@ class TrtYoloDetector:
             self._cuda_context = None
 
     def _resolve_input_size(self, input_size):
+        """Use caller-provided size or infer from the engine bindings."""
         if input_size: return (input_size, input_size) if isinstance(input_size, int) else tuple(input_size)
         shape = self._engine.get_binding_shape(self._input_index)
         if len(shape) == 4 and shape[2] > 0 and shape[3] > 0: return (int(shape[2]), int(shape[3]))
         return (640, 640)
 
     def _allocate_buffers(self):
+        """Allocate page-locked host buffers and device buffers for each binding."""
         self._bindings, self._host_inputs, self._device_inputs = [], [], []
         self._host_outputs, self._device_outputs, self._output_shapes = [], [], []
         
@@ -251,7 +280,8 @@ class TrtYoloDetector:
             host_mem = cuda.pagelocked_empty(size, dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
             
-            # FIXED: Use append instead of index assignment
+            # Track device memory addresses for execute_async_v2.
+            # The order of this list MUST match engine bindings.
             self._bindings.append(int(device_mem)) 
             
             if self._engine.binding_is_input(idx):
@@ -263,6 +293,7 @@ class TrtYoloDetector:
                 self._output_shapes.append(tuple(int(v) for v in shape))
 
     def preprocess(self, image_bgr):
+        """Prepare input tensor: letterbox, normalize, CHW, batch."""
         image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         resized, ratio, pad = _letterbox(image, self.input_size)
         blob = resized.astype(self.input_dtype, copy=False)
@@ -273,6 +304,7 @@ class TrtYoloDetector:
         return blob, ratio, pad
 
     def predict(self, image_bgr, conf_thres=None, iou_thres=None, verbose=True):
+        """Run inference and return a list of detections."""
         conf_thres = conf_thres or self.conf_thres
         iou_thres = iou_thres or self.iou_thres
 
@@ -282,6 +314,7 @@ class TrtYoloDetector:
         cuda.memcpy_htod_async(self._device_inputs[0], self._host_inputs[0], self._stream)
 
         # 2. Inference
+        # Everything runs on one CUDA stream to keep H<->D copies ordered.
         start = time.perf_counter()
         self._context.execute_async_v2(bindings=self._bindings, stream_handle=self._stream.handle)
         for h, d in zip(self._host_outputs, self._device_outputs):

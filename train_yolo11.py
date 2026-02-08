@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Finetune a YOLOv11 model with optional class-balanced resampling.
+
+This script reads a data.yaml (Ultralytics format), optionally creates a
+balanced train list by oversampling underrepresented classes, writes a
+new data_balanced.yaml, and launches Ultralytics training.
+"""
+
 import argparse
 import random
 import sys
@@ -7,6 +14,7 @@ from pathlib import Path
 
 
 def _parse_data_yaml(data_yaml: Path) -> dict[str, str]:
+    """Parse a minimal subset of Ultralytics data.yaml (path/train/val/test)."""
     try:
         content = data_yaml.read_text(encoding="utf-8")
     except OSError as exc:
@@ -36,6 +44,7 @@ def _parse_data_yaml(data_yaml: Path) -> dict[str, str]:
 
 
 def _resolve_data_root(data_yaml: Path, root_entry: str) -> Path:
+    """Resolve the dataset root (absolute or relative to the YAML file)."""
     root_path = Path(root_entry).expanduser()
     if not root_path.is_absolute():
         root_path = (data_yaml.parent / root_path).resolve()
@@ -43,6 +52,7 @@ def _resolve_data_root(data_yaml: Path, root_entry: str) -> Path:
 
 
 def _resolve_list_path(data_root: Path, entry: str) -> Path:
+    """Resolve train/val/test list paths relative to the dataset root."""
     list_path = Path(entry).expanduser()
     if not list_path.is_absolute():
         list_path = (data_root / list_path).resolve()
@@ -50,6 +60,7 @@ def _resolve_list_path(data_root: Path, entry: str) -> Path:
 
 
 def _load_train_images(train_list_path: Path, data_root: Path) -> list[Path]:
+    """Read the list of training images into absolute paths."""
     try:
         content = train_list_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -72,6 +83,7 @@ def _load_train_images(train_list_path: Path, data_root: Path) -> list[Path]:
 def _collect_image_class_counts(
     train_images: list[Path], labels_dir: Path
 ) -> tuple[dict[Path, dict[int, int]], dict[int, list[Path]]]:
+    """Count object instances per image and map classes to their images."""
     image_class_counts: dict[Path, dict[int, int]] = {}
     class_to_images: dict[int, list[Path]] = {}
     for image_path in train_images:
@@ -104,9 +116,11 @@ def _build_balanced_train_list_objects(
     class_to_images: dict[int, list[Path]],
     seed: int,
 ) -> tuple[list[Path], dict[int, int], dict[int, int]]:
+    """Oversample images so all classes reach the max instance count."""
     if not class_to_images:
         return [], {}, {}
 
+    # Count total object instances per class across the dataset.
     class_totals: dict[int, int] = {}
     for class_id, images in class_to_images.items():
         total = 0
@@ -117,6 +131,7 @@ def _build_balanced_train_list_objects(
     if not class_totals:
         return [], {}, {}
 
+    # We oversample until each class reaches the max instance count.
     max_instances = max(class_totals.values())
     if max_instances == 0:
         return [], {}, {}
@@ -130,6 +145,7 @@ def _build_balanced_train_list_objects(
             continue
         images = class_to_images[class_id]
         weights = [image_class_counts[img].get(class_id, 0) for img in images]
+        # Weighted sampling favors images that contain more of the target class.
         while balanced_totals[class_id] < max_instances:
             chosen = rng.choices(images, weights=weights, k=1)[0]
             balanced.append(chosen)
@@ -141,6 +157,7 @@ def _build_balanced_train_list_objects(
 
 
 def _format_class_counts(counts: dict[int, int]) -> list[str]:
+    """Pretty-print class counts for the console summary."""
     lines: list[str] = []
     for class_id in sorted(counts):
         lines.append(f"  class {class_id}: {counts[class_id]}")
@@ -150,6 +167,7 @@ def _format_class_counts(counts: dict[int, int]) -> list[str]:
 def _write_balanced_data_yaml(
     src_yaml: Path, dst_yaml: Path, train_entry: str
 ) -> None:
+    """Write a new data.yaml with the balanced train list entry."""
     content = src_yaml.read_text(encoding="utf-8")
     lines = content.splitlines()
     new_lines: list[str] = []
@@ -243,6 +261,7 @@ def main() -> None:
     if args.no_balance:
         train_data_yaml = data_yaml
     else:
+        # Build a balanced train list by oversampling underrepresented classes.
         train_images = _load_train_images(train_list_path, data_root)
         image_class_counts, class_to_images = _collect_image_class_counts(
             train_images, labels_dir
@@ -291,6 +310,7 @@ def main() -> None:
 
     run_name = args.name or f"{model_path.stem}_signs"
     model = YOLO(str(model_path))
+    # Default Ultralytics augmentation + additional tweaks for small datasets.
     augment_args = {
         "hsv_h": 0.015,
         "hsv_s": 0.7,

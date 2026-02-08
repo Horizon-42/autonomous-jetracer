@@ -1,3 +1,11 @@
+"""Flask dashboard for live telemetry and camera streaming over ZMQ.
+
+The Jetson publishes multipart messages:
+  [b"dashboard", JSON telemetry, JPEG image]
+This app subscribes, keeps the latest frame/telemetry in memory, and
+serves a small web UI with a live feed + signal plot.
+"""
+
 import json
 import logging
 import threading
@@ -19,12 +27,14 @@ log = logging.getLogger("dashboard")
 # Configuration
 # ──────────────────────────────────────────────
 
+# Jetson endpoint for ZMQ telemetry.
 JETSON_IP = "192.168.0.103"
 DATA_PORT = 5555
 DEBUG_MODE = False
 
 app = Flask(__name__)
 
+# Shared state populated by the ZMQ listener thread.
 latest_frame = None
 latest_telemetry = {
     "raw_steer": 0.0,
@@ -42,6 +52,7 @@ lock = threading.Lock()
 # ──────────────────────────────────────────────
 
 def _correct_white_balance(frame: np.ndarray) -> np.ndarray:
+    """Simple gray-world white balance to reduce camera color cast."""
     avg = frame.mean(axis=(0, 1))
     gray = avg.mean()
     scale = gray / (avg + 1e-6)
@@ -70,6 +81,7 @@ def zmq_listener():
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
             if frame is not None:
+                # Visual overlays for quick sanity checks in the UI.
                 cv2.rectangle(frame, (80, 0), (560, 479), (0, 255, 0), 1)
                 for d in telemetry.get("detections", []):
                     x, y, w, h = d["box"]
@@ -84,6 +96,7 @@ def zmq_listener():
                     )
 
             with lock:
+                # Keep latest data in memory for the Flask routes.
                 latest_frame = _correct_white_balance(frame) if frame is not None else None
                 latest_telemetry = telemetry
 
@@ -96,6 +109,7 @@ def _run_debug_loop():
     global latest_frame, latest_telemetry
 
     while True:
+        # Simple synthetic feed for UI development without a Jetson.
         fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
         cv2.putText(
             fake_frame, "DEBUG", (240, 250),
@@ -122,6 +136,7 @@ def _run_debug_loop():
 # Routes
 # ──────────────────────────────────────────────
 
+# Inline HTML so the dashboard can be launched as a single file.
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -463,6 +478,7 @@ DASHBOARD_HTML = '''
         window.addEventListener("resize", resizeCanvas);
         resizeCanvas();
 
+        // SmoothieChart renders a scrolling time-series in <canvas>.
         var chart = new SmoothieChart({
             millisPerPixel: 14,
             interpolation: "bezier",
@@ -505,6 +521,7 @@ DASHBOARD_HTML = '''
 
         var DANGER_CLASSES = new Set(["stop sign", "stop_sign", "child"]);
 
+        // Poll JSON telemetry and update UI + chart.
         setInterval(function() {
             fetch("/data").then(function(r) { return r.json(); }).then(function(d) {
                 var now = Date.now();
@@ -586,6 +603,7 @@ def video_feed():
                 )
             time.sleep(0.04)
 
+    # Multipart JPEG stream for the <img> tag.
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 

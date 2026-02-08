@@ -1,3 +1,10 @@
+"""Quick MobileNet-SSD TensorRT inference test on a folder of images.
+
+Diagnostic helper:
+- Loads a TensorRT engine.
+- Runs inference on each test image.
+- Applies NMS and draws boxes to disk.
+"""
 
 import cv2
 import tensorrt as trt
@@ -73,6 +80,7 @@ class TRTInference:
 
     def infer(self, img_np):
 
+        # TensorRT expects a contiguous 1D buffer in CHW order.
         np.copyto(self.inputs[0]['host'], img_np.ravel())
 
         cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
@@ -93,6 +101,7 @@ class TRTInference:
 
 def preprocess(image):
 
+    """Resize + normalize + CHW conversion for MobileNet-SSD."""
     # 1. Resize to 300x300 (Standard SSD Input)
 
     resized = cv2.resize(image, (300, 300))
@@ -128,6 +137,7 @@ def preprocess(image):
 
 def postprocess(outputs, labels, w, h):
 
+    """Decode SSD outputs and apply NMS to get final detections."""
     # 1. Identify which output is Boxes vs Scores
 
     arr1, arr2 = outputs[0], outputs[1]

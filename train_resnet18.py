@@ -1,3 +1,13 @@
+"""Train a ResNet-18 steering model on DonkeyCar-style driving logs.
+
+This script expects a zip archive containing:
+  - catalog.csv (with cam/image_array, user/angle, user/throttle)
+  - images/ (the image files referenced in the catalog)
+
+It performs basic augmentation, trains a 2-output regression model
+(steering + throttle), and saves a .pth checkpoint.
+"""
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -13,16 +23,19 @@ import shutil
 import random
 
 # --- CONFIGURATION ---
+# Input dataset zip and extract location.
 ZIP_PATH = './merged_dataset_v1.zip'  
 EXTRACT_DIR = './dataset'             
 OUTPUT_DIR = './output_models'        
 
+# Training hyperparameters.
 MODELS_TO_TRAIN = ['resnet18']
 BATCH_SIZE = 64
 EPOCHS = 35
 LEARNING_RATE = 1e-4
 
 # 1. Setup Data
+# Clean and unzip the dataset to a local working directory.
 if os.path.exists(EXTRACT_DIR):
     shutil.rmtree(EXTRACT_DIR)
 
@@ -32,7 +45,7 @@ with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Auto-detect dataset root
+# Auto-detect dataset root (handles zips that contain a single top-level folder).
 DATA_ROOT = EXTRACT_DIR
 if 'merged_dataset_v1' in os.listdir(EXTRACT_DIR):
     DATA_ROOT = os.path.join(EXTRACT_DIR, 'merged_dataset_v1')
@@ -40,6 +53,7 @@ if 'merged_dataset_v1' in os.listdir(EXTRACT_DIR):
 print(f"Dataset Root: {DATA_ROOT}")
 
 # --- CUSTOM TRANSFORMS ---
+# Simple salt-and-pepper noise to make the model robust to sensor artifacts.
 class AddSaltPepperNoise(object):
     def __init__(self, amount=0.004):
         self.amount = amount
@@ -60,6 +74,7 @@ class AddSaltPepperNoise(object):
         return tensor
 
 # 2. Dataset Class
+# Reads the catalog and loads images on-demand to keep memory usage low.
 class AutonomousDataset(Dataset):
     def __init__(self, catalog_path, img_dir, transform=None):
         self.data = pd.read_csv(catalog_path)
@@ -78,17 +93,20 @@ class AutonomousDataset(Dataset):
         try:
             image = Image.open(img_path).convert('L')
         except:
-            # Fallback if image is corrupt
+            # Fallback if image is corrupt or unreadable.
             return self.__getitem__((idx + 1) % len(self))
 
         angle = float(row['user/angle'])
         throttle = float(row['user/throttle'])
 
-        # Data augmentation: Mirroring
+        # Data augmentation: horizontal flip and steering sign inversion.
+        # DonkeyCar steering is signed: left is negative, right is positive.
+        # When we mirror the image, we must negate the steering angle.
         if random.random() > 0.5:
             image = TF.hflip(image)
             angle = -angle
 
+        # The model predicts [steering, throttle] as a regression target.
         labels = torch.tensor([angle, throttle], dtype=torch.float32)
 
         if self.transform:
@@ -97,6 +115,7 @@ class AutonomousDataset(Dataset):
         return image, labels
 
 # 3. Preprocessing Pipeline
+# Keep the model's input consistent with inference preprocessing.
 train_transform = transforms.Compose([
     transforms.CenterCrop(480),
     transforms.Resize((224, 224)),
@@ -106,6 +125,7 @@ train_transform = transforms.Compose([
     transforms.ColorJitter(brightness=0.25, contrast=0.25),
     transforms.ToTensor(),
     AddSaltPepperNoise(amount=0.02),
+    # Normalize grayscale to [-1, 1] so it matches inference preprocessing.
     transforms.Normalize(mean=[0.5], std=[0.5])
 ])
 
@@ -122,6 +142,7 @@ dataset = AutonomousDataset(
     train_transform
 )
 
+# 90/10 train/val split.
 train_len = int(0.9 * len(dataset))
 val_len = len(dataset) - train_len
 train_set, val_set = random_split(dataset, [train_len, val_len])
@@ -135,6 +156,7 @@ for MODEL_NAME in MODELS_TO_TRAIN:
     print(f"STARTING TRAINING: {MODEL_NAME}")
     print("="*30)
 
+    # ResNet-18 with a 1-channel input and 2 outputs (angle, throttle).
     model = timm.create_model(MODEL_NAME, pretrained=True, num_classes=2, in_chans=1).to(device)
 
     criterion = nn.MSELoss()

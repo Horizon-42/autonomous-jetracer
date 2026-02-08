@@ -1,3 +1,9 @@
+"""Standalone YOLO TensorRT inference diagnostics on test images.
+
+Useful for validating a TensorRT engine and inspecting detections
+before integrating into the live driving pipeline.
+"""
+
 import os
 import sys
 import time
@@ -89,7 +95,7 @@ class TrtYoloDetector:
                 self.outputs.append(binding)
 
     def preprocess(self, img):
-        """ Resize image with Letterbox padding """
+        """Resize image with letterbox padding to match YOLO input."""
         h, w, _ = img.shape
         target_h, target_w = self.input_h, self.input_w
         scale = min(target_w / w, target_h / h)

@@ -1,3 +1,13 @@
+"""Train a MobileNet-V1 SSD detector using a YOLO-format dataset.
+
+Pipeline:
+1) Unzip YOLO dataset.
+2) Convert YOLO labels to Pascal VOC (pytorch-ssd expects VOC).
+3) Split into train/val and write ImageSets files.
+4) Patch pytorch-ssd for newer PyTorch load semantics.
+5) Launch training and copy the newest checkpoint to output_models/.
+"""
+
 import os
 import shutil
 import zipfile
@@ -10,17 +20,19 @@ from xml.dom import minidom
 from sklearn.model_selection import train_test_split
 
 # --- CONFIGURATION ---
+# Input dataset zip in YOLO format (images + .txt labels + classes.txt).
 ZIP_PATH = './yolo_dataset.zip'         
 DATA_DIR = './data/voc_dataset'         
 OUTPUT_DIR = './output_models'          
 REPO_DIR = 'pytorch-ssd'
 
+# Training hyperparameters for pytorch-ssd.
 BATCH_SIZE = 16
 EPOCHS = 30
 LEARNING_RATE = 0.001
 
 def run_command(cmd):
-    """Executes a shell command."""
+    """Executes a shell command and exits on failure."""
     try:
         subprocess.check_call(cmd, shell=True)
     except subprocess.CalledProcessError as e:
@@ -28,6 +40,7 @@ def run_command(cmd):
         sys.exit(1)
 
 # 1. Setup Environment
+# Clone pytorch-ssd if missing and ensure boto3 is installed.
 print("Setting up environment...")
 if not os.path.exists(REPO_DIR):
     print(f"Cloning {REPO_DIR}...")
@@ -36,6 +49,7 @@ if not os.path.exists(REPO_DIR):
     run_command(f'{sys.executable} -m pip install boto3')
 
 # 2. Extract Data
+# Work in a temp folder so we can inspect/convert freely.
 if os.path.exists('./temp_yolo'): shutil.rmtree('./temp_yolo')
 if os.path.exists(DATA_DIR): shutil.rmtree(DATA_DIR)
 os.makedirs('./temp_yolo', exist_ok=True)
@@ -46,6 +60,7 @@ with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
     zip_ref.extractall('./temp_yolo')
 
 # 3. Analyze Class IDs
+# Read classes.txt if present, otherwise use fallback classes.
 print("Analyzing Class IDs...")
 classes_file = None
 for root, dirs, files in os.walk('./temp_yolo'):
@@ -57,9 +72,10 @@ if classes_file:
     with open(classes_file, 'r') as f:
         CLASS_NAMES = [line.strip() for line in f.readlines() if line.strip()]
 else:
+    # Fallback class list if classes.txt is missing.
     CLASS_NAMES = ['stop_sign', 'person', 'car']
 
-# Scan for max ID to ensure compatibility
+# Scan for max ID to ensure compatibility with datasets that have missing classes.
 max_id_found = -1
 all_txts = []
 for root, dirs, files in os.walk('./temp_yolo'):
@@ -77,6 +93,7 @@ for txt_file in all_txts:
                     if cid > max_id_found: max_id_found = cid
                 except ValueError: continue
 
+# Extend the class list if labels reference IDs beyond classes.txt.
 if max_id_found >= len(CLASS_NAMES):
     print(f"Extending class list to cover ID {max_id_found}...")
     for i in range(len(CLASS_NAMES), max_id_found + 1):
@@ -85,6 +102,7 @@ if max_id_found >= len(CLASS_NAMES):
 print(f"Final Class List: {CLASS_NAMES}")
 
 # 4. Convert Data (YOLO -> VOC)
+# YOLO txt -> VOC XML so pytorch-ssd can train.
 print("Converting YOLO data to Pascal VOC format...")
 img_dir = os.path.join(DATA_DIR, 'JPEGImages')
 ann_dir = os.path.join(DATA_DIR, 'Annotations')
@@ -94,6 +112,7 @@ os.makedirs(ann_dir, exist_ok=True)
 os.makedirs(sets_dir, exist_ok=True)
 
 def write_xml(xml_path, img_name, w, h, boxes):
+    """Write a Pascal VOC XML file for a single image."""
     root = ET.Element('annotation')
     ET.SubElement(root, 'filename').text = img_name
     size = ET.SubElement(root, 'size')
@@ -137,17 +156,20 @@ for img_path in all_images:
             p = line.strip().split()
             if len(p) >= 5:
                 cid = int(p[0])
+                # YOLO labels are normalized: class cx cy w h (relative to image).
                 mx, my, mw, mh = float(p[1]), float(p[2]), float(p[3]), float(p[4])
                 xmin = int((mx - mw/2) * w); ymin = int((my - mh/2) * h)
                 xmax = int((mx + mw/2) * w); ymax = int((my + mh/2) * h)
                 xmin=max(0,xmin); ymin=max(0,ymin); xmax=min(w,xmax); ymax=min(h,ymax)
                 boxes.append([cid, xmin, ymin, xmax, ymax])
 
+    # Only include images that actually have at least one labeled object.
     if boxes:
         write_xml(os.path.join(ann_dir, file_id + '.xml'), filename, w, h, boxes)
         valid_ids.append(file_id)
 
 # Create Splits
+# VOC uses ImageSets/Main/*.txt files listing image ids (no extensions).
 train_ids, val_ids = train_test_split(valid_ids, test_size=0.1, random_state=42)
 with open(os.path.join(sets_dir, 'train.txt'), 'w') as f: f.write('\n'.join(train_ids))
 with open(os.path.join(sets_dir, 'val.txt'), 'w') as f: f.write('\n'.join(val_ids))
@@ -158,6 +180,7 @@ with open(os.path.join(DATA_DIR, 'labels.txt'), 'w') as f: f.write('\n'.join(CLA
 print("Conversion Complete.")
 
 # 5. Patch PyTorch Compatibility (Local File Edit)
+# Newer PyTorch versions require weights_only=False for older checkpoints.
 print("Patching source code for PyTorch compatibility...")
 target_file = os.path.join(REPO_DIR, 'vision/ssd/ssd.py')
 
@@ -188,7 +211,7 @@ print("Starting MobileNet-V1 SSD Training...")
 abs_data_dir = os.path.abspath(DATA_DIR)
 abs_model_dir = os.path.abspath(os.path.join('models', 'myssd'))
 
-# Execute training script from within the repo directory
+# Execute training script from within the repo directory.
 cmd = (
     f"cd {REPO_DIR} && {sys.executable} train_ssd.py "
     f"--dataset-type=voc "

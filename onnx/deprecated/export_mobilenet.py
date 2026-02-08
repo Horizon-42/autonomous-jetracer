@@ -1,9 +1,15 @@
+"""Deprecated: export MobileNet-V1 SSD weights to ONNX.
+
+This script lives under deprecated/ because newer pipelines use YOLO.
+It is kept for reference when converting legacy MobileNet SSD models.
+"""
+
 import sys
 import os
 import torch
 
 # --- 1. FIX THE IMPORT PATH ---
-# This tells Python: "Look inside the 'pytorch-ssd' folder for modules"
+# This tells Python: "Look inside the 'pytorch-ssd' folder for modules".
 current_dir = os.path.dirname(os.path.abspath(__file__))
 repo_path = os.path.join(current_dir, 'pytorch-ssd')
 sys.path.append(repo_path)
