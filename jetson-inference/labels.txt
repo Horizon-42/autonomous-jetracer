@@ -1,0 +1,9 @@
+child
+adult
+stop sign
+speed limit zone
+end speed limit zone
+turn right
+yield
+priority road
+general danger
