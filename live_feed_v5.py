@@ -1,11 +1,3 @@
-"""Flask dashboard for live telemetry and camera streaming over ZMQ.
-
-The Jetson publishes multipart messages:
-  [b"dashboard", JSON telemetry, JPEG image]
-This app subscribes, keeps the latest frame/telemetry in memory, and
-serves a small web UI with a live feed + signal plot.
-"""
-
 import json
 import logging
 import threading
@@ -27,14 +19,13 @@ log = logging.getLogger("dashboard")
 # Configuration
 # ──────────────────────────────────────────────
 
-# Jetson endpoint for ZMQ telemetry.
 JETSON_IP = "192.168.3.89"
 DATA_PORT = 5555
+CONTROL_PORT = 5556  # NEW: port for sending control commands
 DEBUG_MODE = False
 
 app = Flask(__name__)
 
-# Shared state populated by the ZMQ listener thread.
 latest_frame = None
 latest_telemetry = {
     "raw_steer": 0.0,
@@ -44,34 +35,50 @@ latest_telemetry = {
     "incident": "NONE",
     "fps": 0.0,
     "detections": [],
+    "is_running": False,
 }
 lock = threading.Lock()
+
+# NEW: Control socket (global)
+control_socket = None
+
 
 # ──────────────────────────────────────────────
 # ZMQ Listener
 # ──────────────────────────────────────────────
 
+
 def _correct_white_balance(frame: np.ndarray) -> np.ndarray:
-    """Simple gray-world white balance to reduce camera color cast."""
-    avg = frame.mean(axis=(0, 1))
-    gray = avg.mean()
-    scale = gray / (avg + 1e-6)
-    corrected = np.clip(frame * scale, 0, 255).astype(np.uint8)
-    return corrected
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+    l, a, b = cv2.split(lab)
+    a_mean, b_mean = a.mean(), b.mean()
+    a = a - (a_mean - 128)
+    b = b - (b_mean - 128)
+    corrected = cv2.merge([l, a, b]).astype(np.uint8)
+    return cv2.cvtColor(corrected, cv2.COLOR_LAB2BGR)
+
 
 def zmq_listener():
-    global latest_frame, latest_telemetry
+    global latest_frame, latest_telemetry, control_socket
 
     if DEBUG_MODE:
         log.warning("Running in DEBUG mode — using synthetic data")
         _run_debug_loop()
         return
 
-    log.info("Connecting to Jetson at %s:%d", JETSON_IP, DATA_PORT)
+    log.info("Connecting to Jetson at %s:%d (data) and :%d (control)", 
+             JETSON_IP, DATA_PORT, CONTROL_PORT)
     ctx = zmq.Context()
+    
+    # Data subscription socket
     sub = ctx.socket(zmq.SUB)
     sub.connect(f"tcp://{JETSON_IP}:{DATA_PORT}")
     sub.setsockopt(zmq.SUBSCRIBE, b"dashboard")
+    
+    # NEW: Control publishing socket
+    control_socket = ctx.socket(zmq.PUB)
+    control_socket.connect(f"tcp://{JETSON_IP}:{CONTROL_PORT}")
+    time.sleep(0.5)  # Give ZMQ time to establish connection
 
     while True:
         try:
@@ -81,7 +88,6 @@ def zmq_listener():
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
             if frame is not None:
-                # Visual overlays for quick sanity checks in the UI.
                 cv2.rectangle(frame, (80, 0), (560, 479), (0, 255, 0), 1)
                 for d in telemetry.get("detections", []):
                     x, y, w, h = d["box"]
@@ -96,7 +102,6 @@ def zmq_listener():
                     )
 
             with lock:
-                # Keep latest data in memory for the Flask routes.
                 latest_frame = _correct_white_balance(frame) if frame is not None else None
                 latest_telemetry = telemetry
 
@@ -109,7 +114,6 @@ def _run_debug_loop():
     global latest_frame, latest_telemetry
 
     while True:
-        # Simple synthetic feed for UI development without a Jetson.
         fake_frame = np.zeros((480, 640, 3), dtype=np.uint8)
         cv2.putText(
             fake_frame, "DEBUG", (240, 250),
@@ -125,6 +129,7 @@ def _run_debug_loop():
             "detections": [
                 {"class": "stop_sign", "score": 0.95, "box": [200, 150, 100, 100]}
             ],
+            "is_running": int(time.time()) % 20 > 10,
         }
         with lock:
             latest_frame = fake_frame
@@ -136,7 +141,6 @@ def _run_debug_loop():
 # Routes
 # ──────────────────────────────────────────────
 
-# Inline HTML so the dashboard can be launched as a single file.
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -196,6 +200,11 @@ DASHBOARD_HTML = '''
             padding-bottom: 12px;
             border-bottom: 1px solid var(--border);
         }
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
         .header-title {
             font-family: var(--font-mono);
             font-size: 13px;
@@ -214,6 +223,58 @@ DASHBOARD_HTML = '''
         @keyframes pulse-dot {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.4; }
+        }
+
+        /* Control buttons */
+        .control-buttons {
+            display: flex;
+            gap: 8px;
+        }
+        .control-btn {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            padding: 8px 20px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-card);
+            color: var(--text-primary);
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .control-btn:hover {
+            background: var(--bg-card-alt);
+            border-color: var(--text-secondary);
+        }
+        .control-btn:active {
+            transform: scale(0.96);
+        }
+        .control-btn.start {
+            border-color: rgba(74, 222, 128, 0.4);
+            color: var(--accent-green);
+        }
+        .control-btn.start:hover {
+            background: rgba(74, 222, 128, 0.08);
+            border-color: var(--accent-green);
+        }
+        .control-btn.stop {
+            border-color: rgba(239, 68, 68, 0.4);
+            color: var(--accent-red);
+        }
+        .control-btn.stop:hover {
+            background: rgba(239, 68, 68, 0.08);
+            border-color: var(--accent-red);
+        }
+        .control-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+        .control-btn:disabled:hover {
+            background: var(--bg-card);
+            border-color: var(--border);
+            transform: none;
         }
 
         /* Top row */
@@ -342,6 +403,8 @@ DASHBOARD_HTML = '''
         }
 
         /* Status colors */
+        .status-idle     { color: var(--text-dim) !important; }
+        .status-ready    { color: var(--accent-cyan) !important; }
         .status-driving  { color: var(--accent-green) !important; }
         .status-limit    { color: var(--accent-amber) !important; }
         .status-slowing  { color: var(--accent-amber) !important; }
@@ -391,14 +454,55 @@ DASHBOARD_HTML = '''
             font-size: 11px;
             color: var(--text-dim);
         }
+        .det-ago {
+            font-size: 10px;
+            color: var(--text-dim);
+            margin-left: 4px;
+        }
+        .det-tag.det-stale {
+            opacity: 0.45;
+        }
+        .det-meta {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 10px;
+            color: var(--text-dim);
+            margin-left: 6px;
+        }
+        .det-badge {
+            font-family: var(--font-mono);
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            padding: 1px 5px;
+            border-radius: 2px;
+        }
+        .det-badge-active {
+            background: rgba(74, 222, 128, 0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(74, 222, 128, 0.3);
+        }
+        .det-badge-far {
+            background: rgba(113, 113, 122, 0.15);
+            color: var(--text-dim);
+            border: 1px solid rgba(113, 113, 122, 0.3);
+        }
     </style>
 </head>
 <body>
     <div class="dashboard">
 
         <div class="header">
-            <span class="header-title">Race Telemetry</span>
-            <div class="header-dot" id="connDot"></div>
+            <div class="header-left">
+                <span class="header-title">Race Telemetry</span>
+                <div class="header-dot" id="connDot"></div>
+            </div>
+            <div class="control-buttons">
+                <button class="control-btn start" id="startBtn" onclick="sendStart()">▶ Start</button>
+                <button class="control-btn stop" id="stopBtn" onclick="sendStop()">■ Stop</button>
+            </div>
         </div>
 
         <div class="top-row">
@@ -411,7 +515,7 @@ DASHBOARD_HTML = '''
                 <div class="stat-grid">
                     <div class="stat-cell">
                         <span class="stat-key">Status</span>
-                        <span class="stat-val status-driving" id="statusText">READY</span>
+                        <span class="stat-val status-idle" id="statusText">IDLE</span>
                     </div>
                     <div class="stat-cell">
                         <span class="stat-key">Mode</span>
@@ -478,7 +582,6 @@ DASHBOARD_HTML = '''
         window.addEventListener("resize", resizeCanvas);
         resizeCanvas();
 
-        // SmoothieChart renders a scrolling time-series in <canvas>.
         var chart = new SmoothieChart({
             millisPerPixel: 14,
             interpolation: "bezier",
@@ -520,8 +623,74 @@ DASHBOARD_HTML = '''
         chart.streamTo(canvas, 500);
 
         var DANGER_CLASSES = new Set(["stop sign", "stop_sign", "child"]);
+        var DET_PERSIST_MS = 5000;
+        var detHistory = {};
 
-        // Poll JSON telemetry and update UI + chart.
+        function updateDetHistory(dets, now) {
+            for (var i = 0; i < dets.length; i++) {
+                var key = dets[i]["class"];
+                detHistory[key] = {
+                    score: dets[i].score || 0,
+                    area: dets[i].area || 0,
+                    active: dets[i].active !== false,
+                    lastSeen: now
+                };
+            }
+            var keys = Object.keys(detHistory);
+            for (var j = 0; j < keys.length; j++) {
+                if (now - detHistory[keys[j]].lastSeen > DET_PERSIST_MS) {
+                    delete detHistory[keys[j]];
+                }
+            }
+        }
+
+        function renderDetList(now) {
+            var listEl = document.getElementById("detList");
+            var keys = Object.keys(detHistory);
+            if (keys.length === 0) {
+                listEl.innerHTML = '<span class="det-empty">No objects detected</span>';
+                return;
+            }
+            listEl.innerHTML = keys.map(function(name) {
+                var entry = detHistory[name];
+                var ago = Math.floor((now - entry.lastSeen) / 1000);
+                var cls = DANGER_CLASSES.has(name) ? " det-danger" : "";
+                var stale = ago > 0 ? " det-stale" : "";
+                var agoText = ago === 0 ? "now" : ago + "s ago";
+                var badgeCls = entry.active ? "det-badge-active" : "det-badge-far";
+                var badgeText = entry.active ? "active" : "far";
+                return '<span class="det-tag' + cls + stale + '">'
+                    + name + " " + entry.score.toFixed(2)
+                    + '<span class="det-meta">'
+                    + entry.area + "px"
+                    + '<span class="det-badge ' + badgeCls + '">' + badgeText + "</span>"
+                    + '<span class="det-ago">' + agoText + "</span>"
+                    + "</span></span>";
+            }).join("");
+        }
+
+        function sendStart() {
+            fetch("/control/start", {method: "POST"})
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    console.log("Start command sent:", d);
+                })
+                .catch(function(err) {
+                    console.error("Failed to send start:", err);
+                });
+        }
+
+        function sendStop() {
+            fetch("/control/stop", {method: "POST"})
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    console.log("Stop command sent:", d);
+                })
+                .catch(function(err) {
+                    console.error("Failed to send stop:", err);
+                });
+        }
+
         setInterval(function() {
             fetch("/data").then(function(r) { return r.json(); }).then(function(d) {
                 var now = Date.now();
@@ -541,41 +710,45 @@ DASHBOARD_HTML = '''
                 var st = document.getElementById("statusText");
                 st.className = "stat-val";
 
-                if (inc === "STOP") {
-                    st.textContent = "STOPPING";
-                    st.classList.add("status-stopping");
-                    incEl.style.color = "var(--accent-red)";
-                } else if (inc === "CHILD" || inc === "ADULT") {
-                    st.textContent = "SLOWING";
-                    st.classList.add("status-slowing");
-                    incEl.style.color = "var(--accent-amber)";
-                } else if (d.mode === "LIMIT") {
-                    st.textContent = "LIMIT";
-                    st.classList.add("status-limit");
-                    incEl.style.color = "var(--accent-amber)";
+                var isRunning = d.is_running || false;
+                var startBtn = document.getElementById("startBtn");
+                var stopBtn = document.getElementById("stopBtn");
+
+                if (!isRunning) {
+                    st.textContent = "IDLE";
+                    st.classList.add("status-idle");
+                    incEl.style.color = "var(--text-dim)";
+                    startBtn.disabled = false;
+                    stopBtn.disabled = true;
                 } else {
-                    st.textContent = "DRIVING";
-                    st.classList.add("status-driving");
-                    incEl.style.color = "var(--text-primary)";
+                    startBtn.disabled = true;
+                    stopBtn.disabled = false;
+
+                    if (inc === "STOP") {
+                        st.textContent = "STOPPING";
+                        st.classList.add("status-stopping");
+                        incEl.style.color = "var(--accent-red)";
+                    } else if (inc === "CHILD" || inc === "ADULT") {
+                        st.textContent = "SLOWING";
+                        st.classList.add("status-slowing");
+                        incEl.style.color = "var(--accent-amber)";
+                    } else if (d.mode === "LIMIT") {
+                        st.textContent = "LIMIT";
+                        st.classList.add("status-limit");
+                        incEl.style.color = "var(--accent-amber)";
+                    } else {
+                        st.textContent = "DRIVING";
+                        st.classList.add("status-driving");
+                        incEl.style.color = "var(--text-primary)";
+                    }
                 }
 
                 tsRaw.append(now, d.raw_steer || 0);
                 tsSmooth.append(now, d.smooth_steer || 0);
                 tsThrottle.append(now, d.throttle || 0);
 
-                var dets = d.detections || [];
-                var listEl = document.getElementById("detList");
-
-                if (dets.length === 0) {
-                    listEl.innerHTML = '<span class="det-empty">No objects detected</span>';
-                } else {
-                    listEl.innerHTML = dets.map(function(det) {
-                        var cls = DANGER_CLASSES.has(det["class"]) ? " det-danger" : "";
-                        return '<span class="det-tag' + cls + '">'
-                            + det["class"] + " " + (det.score || 0).toFixed(2)
-                            + "</span>";
-                    }).join("");
-                }
+                updateDetHistory(d.detections || [], now);
+                renderDetList(now);
             });
         }, 50);
     </script>
@@ -603,7 +776,6 @@ def video_feed():
                 )
             time.sleep(0.04)
 
-    # Multipart JPEG stream for the <img> tag.
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -611,6 +783,29 @@ def video_feed():
 def data():
     with lock:
         return jsonify(latest_telemetry)
+
+
+# NEW: Control endpoints
+@app.route("/control/start", methods=["POST"])
+def control_start():
+    global control_socket
+    if control_socket is not None:
+        cmd = {"command": "start"}
+        control_socket.send_multipart([b"control", json.dumps(cmd).encode("utf-8")])
+        log.info("▶ START command sent to Jetson")
+        return jsonify({"status": "ok", "command": "start"})
+    return jsonify({"status": "error", "message": "Control socket not initialized"}), 500
+
+
+@app.route("/control/stop", methods=["POST"])
+def control_stop():
+    global control_socket
+    if control_socket is not None:
+        cmd = {"command": "stop"}
+        control_socket.send_multipart([b"control", json.dumps(cmd).encode("utf-8")])
+        log.info("■ STOP command sent to Jetson")
+        return jsonify({"status": "ok", "command": "stop"})
+    return jsonify({"status": "error", "message": "Control socket not initialized"}), 500
 
 
 # ──────────────────────────────────────────────

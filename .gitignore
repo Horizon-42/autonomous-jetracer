@@ -3,3 +3,5 @@ merged_dataset_v3
 yolo
 
 .vscode
+
+.DS_Store
